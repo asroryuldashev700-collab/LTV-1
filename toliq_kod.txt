@@ -1,0 +1,135 @@
+var BASE_URL   = 'https://api.modme.uz';
+var COMPANY_ID = 372;
+var PHONE      = '955000908';
+var PASS       = '2546';
+
+function getToken() {
+  var resp = UrlFetchApp.fetch(BASE_URL + '/v1/auth/login', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ phone: PHONE, password: PASS }),
+    headers: { 'Origin': 'https://deutsch.modme.uz', 'Referer': 'https://deutsch.modme.uz/' },
+    muteHttpExceptions: true
+  });
+  return JSON.parse(resp.getContentText()).access_token;
+}
+
+function apiGet(token, url) {
+  var resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Origin': 'https://deutsch.modme.uz',
+      'Referer': 'https://deutsch.modme.uz/'
+    },
+    muteHttpExceptions: true
+  });
+  try { return JSON.parse(resp.getContentText()); } catch(e) { return null; }
+}
+
+function syncArxiv() {
+  var token = getToken();
+  Logger.log('Token olindi');
+
+  // Barcha arxiv talabalarni yukla
+  var allStudents = [];
+  var page = 1;
+  while (true) {
+    var data = apiGet(token, BASE_URL + '/v1/company/' + COMPANY_ID + '/users/trashed?per_page=200&page=' + page);
+    var list = Array.isArray(data) ? data : (data && data.data ? data.data : []);
+    if (!list || list.length === 0) break;
+    allStudents = allStudents.concat(list);
+    if (list.length < 200) break;
+    page++;
+    Utilities.sleep(300);
+  }
+  Logger.log('Arxiv talabalar soni: ' + allStudents.length);
+
+  // Sheet tayyorla
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Arxiv') || ss.insertSheet('Arxiv');
+  sh.clearContents();
+
+  var headers = [
+    'ID', 'Ism Familiya', 'Telefon', 'Jins', "Tug'ilgan sana", 'Manzil', 'D-kod',
+    'Filial', 'Yaratilgan sana', 'Arxivlangan sana', 'Arxivlagan xodim', 'Izoh', 'Tag',
+    'Guruh 1', 'Kurs 1', 'Ustoz 1',
+    'Guruh 2', 'Kurs 2', 'Ustoz 2',
+    'Guruh 3', 'Kurs 3', 'Ustoz 3',
+    "Jami to'langan (so'm)"
+  ];
+  sh.appendRow(headers);
+
+  // Har 10 talabani batch yoz
+  var rows = [];
+  for (var i = 0; i < allStudents.length; i++) {
+    var st  = allStudents[i];
+    var uid = st.id;
+    var bid = (st.branches && st.branches[0]) ? st.branches[0].id   : '';
+    var bname = (st.branches && st.branches[0]) ? st.branches[0].name : '';
+
+    // Profil
+    var prof = apiGet(token, BASE_URL + '/v1/user/' + uid + '?id=' + uid + '&user_type=student&branch_id=' + bid) || {};
+
+    var address = '', extId = '';
+    if (prof.datas && prof.datas.contacts) {
+      prof.datas.contacts.forEach(function(c) {
+        if (c.name === 'address') address = c.value || '';
+        if (c.name === 'ext_id')  extId   = c.value || '';
+      });
+    }
+    var tag = (prof.tags || []).map(function(t){ return t.title; }).join(', ');
+    var deletedBy = (prof.deleted_by_user) ? (prof.deleted_by_user.name || '') : '';
+
+    // Guruhlar
+    var gd  = apiGet(token, BASE_URL + '/v1/student/' + uid + '/groups?branch_id=' + bid + '&id=' + uid);
+    var grps = Array.isArray(gd) ? gd : (gd && gd.data ? gd.data : []);
+
+    function gName(g) { return g ? g.name || '' : ''; }
+    function gCourse(g) { return (g && g.course) ? g.course.name || '' : ''; }
+    function gTeacher(g) { return (g && g.teachers && g.teachers[0]) ? g.teachers[0].name || '' : ''; }
+
+    // To'lovlar
+    var pays  = apiGet(token, BASE_URL + '/v1/payment?user_id=' + uid + '&branch_id=' + bid);
+    var total = 0;
+    if (Array.isArray(pays)) {
+      pays.forEach(function(p) {
+        var d = parseFloat(p.debit || 0);
+        if (d > 0) total += d;
+      });
+    }
+
+    rows.push([
+      uid,
+      ((st.name || '') + ' ' + (st.surname || '')).trim(),
+      st.phone || '',
+      prof.gender === 'm' ? 'Erkak' : (prof.gender === 'f' ? 'Ayol' : ''),
+      prof.date_of_birth || '',
+      address,
+      extId,
+      bname,
+      (prof.created_at  || '').substring(0, 10),
+      (st.deleted_at    || '').substring(0, 10),
+      deletedBy,
+      prof.comment || '',
+      tag,
+      gName(grps[0]),    gCourse(grps[0]),    gTeacher(grps[0]),
+      gName(grps[1]),    gCourse(grps[1]),    gTeacher(grps[1]),
+      gName(grps[2]),    gCourse(grps[2]),    gTeacher(grps[2]),
+      total
+    ]);
+
+    if (rows.length === 10) {
+      sh.getRange(sh.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+      rows = [];
+      Logger.log((i + 1) + ' / ' + allStudents.length + ' yozildi');
+      Utilities.sleep(150);
+    }
+  }
+
+  if (rows.length > 0) {
+    sh.getRange(sh.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+  }
+
+  Logger.log('TAYYOR! Jami ' + allStudents.length + ' talaba yozildi.');
+}
